@@ -1,23 +1,20 @@
 import os
 import json
 import time
+import math
 import random
 import argparse
+from dataclasses import asdict
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
-from dataset import MMEmoDataset, collate_fn
-from model import MultiModalSentiment
-import matplotlib.pyplot as plt
-import seaborn as sns
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+from dataset import MultiModalDataset, LABEL2ID
+from model import MultiModalSentimentModel, ModelConfig
 
-def seed_all(seed: int = 42):
+def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -26,447 +23,458 @@ def seed_all(seed: int = 42):
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+    # Mac
+    if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
-def _filter_existing_samples(root: str, df: pd.DataFrame) -> pd.DataFrame:
-    data_dir = os.path.join(root, "data")
-    txt_ok = df["guid"].apply(lambda g: os.path.exists(os.path.join(data_dir, f"{g}.txt")))
-    img_ok = df["guid"].apply(lambda g: os.path.exists(os.path.join(data_dir, f"{g}.jpg")))
-    ok = txt_ok & img_ok
-
-    missing = df.loc[~ok, "guid"].tolist()
-    if len(missing) > 0:
-        print(f"[data-check] drop {len(missing)} samples due to missing files (txt/jpg). Example: {missing[:5]}")
-    return df.loc[ok].reset_index(drop=True)
-
-@torch.no_grad()
-def evaluate(model, loader, device, args, priors: torch.Tensor):
-    """
-    Route B: logit adjustment / prior correction
-      logits' = logits - tau * log(prior)
-    priors: shape [3], order = (neg, neu, pos)
-    """
-    model.eval()
-    y_true, y_pred = [], []
-
-    # 避免 log(0)
-    priors = torch.clamp(priors, min=1e-12).to(device)
-    log_priors = torch.log(priors)
-
-    for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        image = batch["image"].to(device)
-        labels = batch["labels"].to(device)
-
-        logits = model(input_ids, attention_mask, image)
-
-        # logit adjustment
-        if args.logit_adjust:
-            # broadcast: [B,3] - [3]
-            logits = logits - (args.adjust_tau * log_priors)
-
-        pred = torch.argmax(logits, dim=1).cpu().numpy().tolist()
-        y_pred.extend(pred)
-        y_true.extend(labels.cpu().numpy().tolist())
-
-    acc = accuracy_score(y_true, y_pred)
-    mf1 = f1_score(y_true, y_pred, average="macro")
-
-    report = classification_report(
-        y_true,
-        y_pred,
-        target_names=["negative", "neutral", "positive"],
-        digits=4
-    )
-    cm = confusion_matrix(y_true, y_pred)
-    return acc, mf1, report, cm
-
 class FocalLoss(nn.Module):
-    def __init__(self, weight=None, gamma: float = 2.0):
+    def __init__(self, gamma: float = 1.5, weight=None):
         super().__init__()
-        self.weight = weight
-        self.gamma = float(gamma)
+        self.gamma = gamma
+        self.register_buffer("weight", weight if weight is not None else None)
 
     def forward(self, logits, target):
-        ce = nn.functional.cross_entropy(logits, target, weight=self.weight, reduction="none")
-        pt = torch.exp(-ce)
-        loss = ((1.0 - pt) ** self.gamma) * ce
+        logp = F.log_softmax(logits, dim=-1)
+        p = torch.exp(logp)
+        # 取目标类的概率
+        pt = p.gather(1, target.unsqueeze(1)).squeeze(1)
+        logpt = logp.gather(1, target.unsqueeze(1)).squeeze(1)
+        loss = -((1 - pt) ** self.gamma) * logpt
+        if self.weight is not None:
+            w = self.weight.gather(0, target)
+            loss = loss * w
         return loss.mean()
 
-def freeze_module(m: nn.Module, freeze: bool):
-    for p in m.parameters():
-        p.requires_grad = not freeze
+def label_smoothing_ce(logits, target, smoothing=0.1, weight=None):
+    n = logits.size(-1)
+    logp = F.log_softmax(logits, dim=-1)
+    with torch.no_grad():
+        true_dist = torch.zeros_like(logp)
+        true_dist.fill_(smoothing / (n - 1))
+        true_dist.scatter_(1, target.unsqueeze(1), 1.0 - smoothing)
+    if weight is not None:
+        w = weight.unsqueeze(0)  # (1,C)
+        loss = -(true_dist * logp) * w
+        return loss.sum(dim=-1).mean()
+    return -(true_dist * logp).sum(dim=-1).mean()
 
-def build_optimizer(args, model: nn.Module, mode: str):
-    """
-    分组学习率：
-    - text_encoder: args.lr_text
-    - image_encoder: args.lr_img
-    - 其余 head: args.lr_head
-    """
-    params_text, params_img, params_head = [], [], []
+def compute_class_stats(dataset: MultiModalDataset):
+    counts = np.zeros(3, dtype=np.int64)
+    for s in dataset.samples:
+        # dataset.samples 里是 Sample(guid, text, label, image_key)
+        y = getattr(s, "label", None)
+        if y is None:
+            continue
+        if isinstance(y, int):
+            counts[int(y)] += 1
+        else:
+            counts[LABEL2ID[str(y).strip().lower()]] += 1
+    return counts
 
+def make_sampler_from_counts(counts: np.ndarray, power: float = 0.5):
+    w = (counts.sum() / np.maximum(counts, 1)) ** power
+    w = w / w.mean()
+    return w.astype(np.float32)
+
+@torch.no_grad()
+def evaluate(model, loader, device, logit_adjust=None):
+    model.eval()
+    all_logits = []
+    all_y = []
+    for batch in loader:
+        input_ids = batch["input_ids"].to(device)
+        attn = batch["attention_mask"].to(device)
+        img = batch["image"].to(device)
+        y = batch["label"].to(device)
+
+        logits = model(input_ids=input_ids, attention_mask=attn, images=img)
+        if logit_adjust is not None:
+            logits = logits + logit_adjust
+
+        all_logits.append(logits.detach().cpu())
+        all_y.append(y.detach().cpu())
+
+    logits = torch.cat(all_logits, dim=0)
+    y = torch.cat(all_y, dim=0)
+
+    pred = logits.argmax(dim=-1)
+    acc = (pred == y).float().mean().item()
+
+    # macro f1
+    f1s = []
+    for c in range(3):
+        tp = ((pred == c) & (y == c)).sum().item()
+        fp = ((pred == c) & (y != c)).sum().item()
+        fn = ((pred != c) & (y == c)).sum().item()
+        prec = tp / (tp + fp + 1e-12)
+        rec = tp / (tp + fn + 1e-12)
+        f1 = 2 * prec * rec / (prec + rec + 1e-12)
+        f1s.append(f1)
+    macro_f1 = float(np.mean(f1s))
+    return acc, macro_f1
+
+class EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(p.detach(), alpha=1 - self.decay)
+
+    @torch.no_grad()
+    def apply_to(self, model: nn.Module):
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self.backup[name] = p.detach().clone()
+                p.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        for name, p in model.named_parameters():
+            if name in getattr(self, "backup", {}):
+                p.copy_(self.backup[name])
+        self.backup = {}
+
+def build_optimizer(model, base_lr, wd, head_lr_mul=5.0):
+    """
+    训练策略：encoder 用 base_lr，head 用更大 lr（通常能显著抬升 acc）
+    """
+    decay, no_decay = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if n.startswith("text_encoder."):
-            params_text.append(p)
-        elif n.startswith("image_encoder."):
-            params_img.append(p)
+        if any(k in n for k in ["bias", "LayerNorm.weight", "layer_norm.weight"]):
+            no_decay.append(p)
         else:
-            params_head.append(p)
+            decay.append(p)
 
-    groups = []
-    if mode in ["multimodal", "text_only"] and len(params_text) > 0:
-        groups.append({"params": params_text, "lr": args.lr_text})
-    if mode in ["multimodal", "image_only"] and len(params_img) > 0:
-        groups.append({"params": params_img, "lr": args.lr_img})
-    if len(params_head) > 0:
-        groups.append({"params": params_head, "lr": args.lr_head})
+    # 找 head / proj / fusion 参数给更大学习率
+    head_params, base_params = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(k in n for k in ["head", "text_proj", "img_proj", "gate", "cross"]):
+            head_params.append(p)
+        else:
+            base_params.append(p)
 
-    optimizer = torch.optim.AdamW(groups, weight_decay=args.wd)
-    return optimizer
-
-def build_sampler(train_df: pd.DataFrame):
-    """
-    WeightedRandomSampler：按类别反比概率抽样（用于 neutral 少数类）
-    """
-    label2idx = {"negative": 0, "neutral": 1, "positive": 2}
-    y = train_df["tag"].map(label2idx).values
-    class_count = np.bincount(y, minlength=3)
-    class_w = 1.0 / np.sqrt(np.maximum(class_count, 1))
-    sample_w = class_w[y]
-    sampler = WeightedRandomSampler(
-        weights=torch.tensor(sample_w, dtype=torch.double),
-        num_samples=len(sample_w),
-        replacement=True
-    )
-    return sampler, class_count.tolist(), class_w.tolist()
-
-def _compute_priors_from_train_df(train_df: pd.DataFrame, device):
-    """
-    返回 priors: torch.Tensor([p_neg, p_neu, p_pos])  (neg, neu, pos)
-    用真实训练集分布（未被 sampler 改过的 train_df）计算。
-    """
-    counts = train_df["tag"].value_counts()
-    n = len(train_df)
-    p_neg = counts.get("negative", 0) / max(n, 1)
-    p_neu = counts.get("neutral", 0) / max(n, 1)
-    p_pos = counts.get("positive", 0) / max(n, 1)
-    priors = torch.tensor([p_neg, p_neu, p_pos], dtype=torch.float, device=device)
-    return priors, counts
+    param_groups = [
+        {"params": base_params, "lr": base_lr, "weight_decay": wd},
+        {"params": head_params, "lr": base_lr * head_lr_mul, "weight_decay": wd},
+    ]
+    return torch.optim.AdamW(param_groups)
 
 def train_one_mode(args, mode: str):
-    seed_all(args.seed)
     device = get_device()
+    print("device:", device)
 
-    root = os.path.abspath(os.path.join(args.code_dir, "..", "project5"))  # project5/
+    tokenizer_name = args.clip_name if args.use_clip else args.text_model
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-    # 1) 严格以 train.txt 为准
-    train_txt_path = os.path.join(root, "train.txt")
-    df = pd.read_csv(train_txt_path, dtype={"guid": str, "tag": str})
-    df["guid"] = df["guid"].astype(str).str.strip()
-    df["tag"] = df["tag"].astype(str).str.strip().str.lower()
+    if args.use_clip:
+        tokenizer.model_max_length = min(tokenizer.model_max_length, 77)
 
-    # 2) 去重 guid（冗余）
-    dup_cnt = df.duplicated(subset=["guid"]).sum()
-    if dup_cnt > 0:
-        print(f"[label-check] train.txt has {dup_cnt} duplicated guid rows -> keep first occurrence.")
-    df = df.drop_duplicates(subset=["guid"], keep="first").reset_index(drop=True)
-
-    # 3) 标签合法性检查
-    valid = {"negative", "neutral", "positive"}
-    bad = df.loc[~df["tag"].isin(valid)]
-    if len(bad) > 0:
-        print("[label-check] invalid tags examples:\n", bad.head())
-        df = df[df["tag"].isin(valid)].reset_index(drop=True)
-
-    # 4) 严格只用 train.txt 的 guid，同时保证 data/ 文件存在
-    df = _filter_existing_samples(root, df)
-
-    # stratified split
-    train_df, val_df = train_test_split(
-        df,
-        test_size=args.val_ratio,
-        random_state=args.seed,
-        stratify=df["tag"],
-    )
-
-    # --- priors（用于 logit adjust） ---
-    priors, counts = _compute_priors_from_train_df(train_df, device)
-    if args.logit_adjust:
-        print(f"[{mode}] logit_adjust enabled. priors(neg,neu,pos)={priors.detach().cpu().numpy().round(4).tolist()} tau={args.adjust_tau}")
-
-    tokenizer = AutoTokenizer.from_pretrained(args.text_model)
-
-    train_set = MMEmoDataset(
-        root, train_df, tokenizer,
+    train_set = MultiModalDataset(
+        data_path=args.train_path,
+        image_root=args.image_root,
+        tokenizer=tokenizer,
         max_len=args.max_len,
         image_size=args.image_size,
-        is_train=True,
-        clean_text_flag=args.clean_text,
+        train=True,
+        text_clean=args.text_clean,
+        img_aug=args.img_aug,
     )
-    val_set = MMEmoDataset(
-        root, val_df, tokenizer,
+    val_set = MultiModalDataset(
+        data_path=args.val_path,
+        image_root=args.image_root,
+        tokenizer=tokenizer,
         max_len=args.max_len,
         image_size=args.image_size,
-        is_train=False,
-        clean_text_flag=args.clean_text,
+        train=False,
+        text_clean=args.text_clean,
+        img_aug="none",
     )
 
-    # sampler（训练集）
-    if args.use_sampler:
-        sampler, class_count, class_w = build_sampler(train_df)
-        print(f"[{mode}] sampler enabled. class_count={class_count}, inv_class_weight={class_w}")
-        train_loader = DataLoader(
-            train_set,
-            batch_size=args.bs,
-            sampler=sampler,
-            shuffle=False,
-            num_workers=2,
-            persistent_workers=True,
-            prefetch_factor=2,
-            collate_fn=collate_fn
-        )
-    else:
-        train_loader = DataLoader(
-            train_set,
-            batch_size=args.bs,
-            shuffle=True,
-            num_workers=2,
-            persistent_workers=True,
-            prefetch_factor=2,
-            collate_fn=collate_fn
-        )
+    counts = compute_class_stats(train_set)
+    inv_w = make_sampler_from_counts(counts, power=args.class_weight_power)
+    print(f"[{mode}] class_count={counts.tolist()}, inv_class_weight={inv_w.tolist()}")
 
+    sampler = None
+    if args.sampler:
+        # 按样本标签给权重
+        sample_w = []
+        for s in train_set.samples:
+            y = getattr(s, "label", None)
+            if y is None:
+                continue
+            if isinstance(y, int):
+                yy = int(y)
+            else:
+                yy = LABEL2ID[str(y).strip().lower()]
+            sample_w.append(float(inv_w[yy]))
+
+        sampler = WeightedRandomSampler(sample_w, num_samples=len(sample_w), replacement=True)
+        print(f"[{mode}] sampler enabled.")
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.bs,
+        shuffle=(sampler is None),
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
     val_loader = DataLoader(
         val_set,
         batch_size=args.bs,
         shuffle=False,
-        num_workers=2,
-        persistent_workers=True,
-        prefetch_factor=2,
-        collate_fn=collate_fn
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
     )
 
-    model = MultiModalSentiment(
-        text_model_name=args.text_model,
-        mode=mode,
-        dropout=args.dropout,
+    # logit adjust
+    logit_adjust = None
+    if args.logit_adjust:
+        priors = counts / counts.sum()
+        log_prior = torch.log(torch.tensor(priors + 1e-12, dtype=torch.float32))
+        logit_adjust = (-args.adjust_tau * log_prior).to(device)
+        print(f"[{mode}] logit_adjust enabled. priors={priors.tolist()} tau={args.adjust_tau}")
+
+    cfg = ModelConfig(
         num_classes=3,
-    ).to(device)
+        dropout=args.dropout,
+        proj_dim=args.proj_dim,
+        fusion=args.fusion,
+        mode=mode,
+        use_clip=args.use_clip,
+        clip_name=args.clip_name,
+        freeze_image=(args.freeze_image_epochs > 0),
+    )
 
-    # 训练前冻结 image_encoder 若指定
-    if mode in ["multimodal", "image_only"] and args.freeze_img_epochs > 0:
-        freeze_module(model.image_encoder, freeze=True)
-        print(f"[{mode}] freeze image_encoder for first {args.freeze_img_epochs} epoch(s).")
+    text_backbone = args.clip_name if args.use_clip else args.text_model
+    model = MultiModalSentimentModel(text_backbone, cfg).to(device)
 
-    # 类别权重（仍保留，用于 CE/Focal）
-    total = counts.sum()
-    neg = counts.get("negative", 1)
-    neu = counts.get("neutral", 1)
-    pos = counts.get("positive", 1)
-
-    # sqrt-balanced
-    w_neg = (total / (3.0 * neg)) ** 0.5
-    w_neu = (total / (3.0 * neu)) ** 0.5
-    w_pos = (total / (3.0 * pos)) ** 0.5
-    class_weights = torch.tensor([w_neg, w_neu, w_pos], dtype=torch.float, device=device)
-
-    print(f"[{mode}] class counts: {dict(counts)}")
-    print(f"[{mode}] class weights (sqrt-balanced): {class_weights.tolist()}  (neg, neu, pos)")
+    # freeze/unfreeze image encoder
+    freeze_until = args.freeze_image_epochs if mode in ["multimodal", "image_only"] else 0
 
     # loss
+    class_weight = torch.tensor(inv_w, dtype=torch.float32).to(device) if args.use_class_weight else None
+
     if args.use_focal:
-        criterion = FocalLoss(weight=class_weights, gamma=args.focal_gamma)
+        criterion = FocalLoss(gamma=args.focal_gamma, weight=class_weight)
         print(f"[{mode}] use FocalLoss(gamma={args.focal_gamma}).")
     else:
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        print(f"[{mode}] use CrossEntropyLoss(weighted).")
+        criterion = None  # use CE / LS later
 
-    # optimizer（分组学习率）
-    optimizer = build_optimizer(args, model, mode)
+    optimizer = build_optimizer(model, base_lr=args.lr, wd=args.wd, head_lr_mul=args.head_lr_mul)
 
-    total_steps = len(train_loader) * args.epochs
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(total_steps * args.warmup),
-        num_training_steps=total_steps
-    )
+    total_steps = args.epochs * len(train_loader)
+    warmup_steps = int(total_steps * args.warmup)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    os.makedirs(args.run_dir, exist_ok=True)
+    scaler = None
+    ema = EMA(model, decay=args.ema_decay) if args.ema else None
+
     best_mf1 = -1.0
+    best_acc = -1.0
     best_path = os.path.join(args.run_dir, f"best_{mode}.pt")
-
+    history = []  # 记录每个 epoch 的指标，最后写成 json
     patience = args.patience
     no_improve = 0
-    best_ep = -1
 
     for ep in range(1, args.epochs + 1):
-        # 到点解冻 image_encoder
-        if mode in ["multimodal", "image_only"] and args.freeze_img_epochs > 0 and ep == args.freeze_img_epochs + 1:
-            freeze_module(model.image_encoder, freeze=False)
-            print(f"[{mode}] unfreeze image_encoder at epoch {ep}.")
-
-            optimizer = build_optimizer(args, model, mode)
-            total_steps = len(train_loader) * (args.epochs - ep + 1)
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=int(total_steps * args.warmup),
-                num_training_steps=total_steps
-            )
-
         model.train()
-        pbar = tqdm(train_loader, desc=f"[{mode}] epoch {ep}/{args.epochs}")
-        losses = []
 
-        for batch in pbar:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            image = batch["image"].to(device)
-            labels = batch["labels"].to(device)
+        # unfreeze at epoch
+        if freeze_until > 0 and ep > freeze_until:
+            # only if using resnet (not clip)
+            if not args.use_clip and hasattr(model, "image_encoder"):
+                for p in model.image_encoder.parameters():
+                    p.requires_grad = True
+                freeze_until = 0
+                print(f"[{mode}] unfreeze image_encoder at epoch {ep}.")
 
+        total_loss = 0.0
+        for batch in train_loader:
             optimizer.zero_grad(set_to_none=True)
-            logits = model(input_ids, attention_mask, image)
-            loss = criterion(logits, labels)
+
+            input_ids = batch["input_ids"].to(device)
+            attn = batch["attention_mask"].to(device)
+            img = batch["image"].to(device)
+            y = batch["label"].to(device)
+            
+            logits = model(input_ids=input_ids, attention_mask=attn, images=img)
+            if logit_adjust is not None:
+                logits = logits + logit_adjust
+
+            if args.use_focal:
+                loss = criterion(logits, y)
+            else:
+                if args.label_smoothing > 0:
+                    loss = label_smoothing_ce(logits, y, smoothing=args.label_smoothing, weight=class_weight)
+                else:
+                    loss = F.cross_entropy(logits, y, weight=class_weight)
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
             optimizer.step()
             scheduler.step()
 
-            losses.append(loss.item())
-            pbar.set_postfix(loss=float(np.mean(losses)))
+            if ema is not None:
+                ema.update(model)
 
-        acc, mf1, report, cm = evaluate(model, val_loader, device, args, priors)
-        tag = " (logit_adjust)" if args.logit_adjust else ""
-        print(f"[{mode}] epoch {ep}: val_acc={acc:.4f} val_macro_f1={mf1:.4f}{tag}")
-        print(report)
+            total_loss += loss.item()
 
-        if mf1 > best_mf1:
-            best_mf1 = mf1
+        avg_loss = total_loss / max(1, len(train_loader))
+
+        # eval (EMA weights if enabled)
+        if ema is not None:
+            ema.apply_to(model)
+        val_acc, val_mf1 = evaluate(model, val_loader, device, logit_adjust=logit_adjust)
+        if ema is not None:
+            ema.restore(model)
+
+        print(f"[{mode}] epoch {ep}/{args.epochs}: loss={avg_loss:.4f} val_acc={val_acc:.4f} val_macro_f1={val_mf1:.4f}")
+
+        # 记录每个 epoch 的结果
+        history.append({
+            "epoch": int(ep),
+            "train_loss": float(avg_loss),
+            "val_acc": float(val_acc),
+            "val_macro_f1": float(val_mf1),
+            "lr_base": float(optimizer.param_groups[0]["lr"]),
+            "lr_head": float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else float(optimizer.param_groups[0]["lr"]),
+        })
+
+
+        if val_mf1 > best_mf1:
+            best_mf1 = val_mf1
+            best_acc = val_acc
             no_improve = 0
-            best_ep = ep
 
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "mode": mode,
-                    "text_model": args.text_model,
-                    "clean_text": bool(args.clean_text),
-                    "logit_adjust": bool(args.logit_adjust),
-                    "adjust_tau": float(args.adjust_tau),
-                    "priors_neg_neu_pos": priors.detach().cpu().tolist(),
-                },
-                best_path
-            )
+            if ema is not None:
+                ema.apply_to(model)
+
+            save_obj = {
+                "model_state": model.state_dict(),
+                "cfg": asdict(cfg),
+                "text_model": args.text_model,
+                "args": vars(args),
+            }
+            # 把 logit_adjust 存进去
+            if logit_adjust is not None:
+                save_obj["logit_adjust"] = logit_adjust.detach().cpu()
+
+            torch.save(save_obj, best_path)
+
             print(f"[{mode}] saved best -> {best_path}")
-
-            labels_name = ["negative", "neutral", "positive"]
-            plt.figure(figsize=(6, 5))
-            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                        xticklabels=labels_name, yticklabels=labels_name)
-            plt.xlabel("Predicted")
-            plt.ylabel("True")
-            plt.title(f"Confusion Matrix ({mode})")
-            fig_path = os.path.join(args.run_dir, f"confusion_matrix_{mode}.png")
-            plt.tight_layout()
-            plt.savefig(fig_path)
-            plt.close()
         else:
             no_improve += 1
             if no_improve >= patience:
                 print(f"[{mode}] Early stopping at epoch {ep}, best mf1={best_mf1:.4f}")
                 break
 
+    # 保存每个 epoch 的指标历史
+    hist_path = os.path.join(args.run_dir, f"history_{mode}.json")
+    with open(hist_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+    print(f"[{mode}] saved history -> {hist_path}")
+
     return {
         "mode": mode,
         "best_macro_f1": float(best_mf1),
-        "best_epoch": best_ep,
+        "best_acc": float(best_acc),
         "best_ckpt": best_path,
-        "clean_text": bool(args.clean_text),
-        "use_sampler": bool(args.use_sampler),
-        "use_focal": bool(args.use_focal),
-        "logit_adjust": bool(args.logit_adjust),
-        "adjust_tau": float(args.adjust_tau),
     }
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--code_dir", type=str, default=os.path.dirname(os.path.abspath(__file__)))
-    parser.add_argument("--text_model", type=str, default="bert-base-multilingual-cased")
 
+    # paths
+    parser.add_argument("--train_path", type=str, default="train.jsonl")
+    parser.add_argument("--val_path", type=str, default="val.jsonl")
+    parser.add_argument("--image_root", type=str, default=None)
+    parser.add_argument("--run_dir", type=str, default="runs")
+
+    # backbone
+    parser.add_argument("--text_model", type=str, default="bert-base-multilingual-cased")
+    parser.add_argument("--use_clip", action="store_true")
+    parser.add_argument("--clip_name", type=str, default="openai/clip-vit-base-patch32")
+
+    # training
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--bs", type=int, default=16)
-
-    # 分组学习率
-    parser.add_argument("--lr_text", type=float, default=1e-5)
-    parser.add_argument("--lr_img", type=float, default=1e-5)
-    parser.add_argument("--lr_head", type=float, default=5e-5)
-
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--head_lr_mul", type=float, default=6.0)  # 重点：head 更大学习率，通常显著提 acc
     parser.add_argument("--wd", type=float, default=0.01)
     parser.add_argument("--warmup", type=float, default=0.1)
     parser.add_argument("--dropout", type=float, default=0.2)
-
+    parser.add_argument("--proj_dim", type=int, default=256)
     parser.add_argument("--max_len", type=int, default=128)
     parser.add_argument("--image_size", type=int, default=224)
-
-    parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--run_dir", type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs"))
+    parser.add_argument("--patience", type=int, default=4)
+    parser.add_argument("--amp", action="store_true")  # 仅 cuda 生效
 
-    # 数据&loss&采样
-    parser.add_argument("--clean_text", action="store_true", help="enable text cleaning")
-    parser.add_argument("--no_clean_text", action="store_true", help="disable text cleaning (override)")
+    # data innovation
+    parser.add_argument("--text_clean", type=str, default="basic", choices=["none", "basic", "aggressive"])
+    parser.add_argument("--img_aug", type=str, default="strong", choices=["none", "weak", "strong"])
 
-    parser.add_argument("--use_sampler", action="store_true", help="enable WeightedRandomSampler for train")
-    parser.add_argument("--no_sampler", action="store_true", help="disable sampler (override)")
+    # fusion innovation
+    parser.add_argument("--fusion", type=str, default="gated", choices=["concat", "gated", "cross_attn", "sum"])
 
-    parser.add_argument("--use_focal", action="store_true", help="enable FocalLoss")
-    parser.add_argument("--focal_gamma", type=float, default=2.0)
+    # loss / threshold innovation
+    parser.add_argument("--sampler", action="store_true", help="WeightedRandomSampler")
+    parser.add_argument("--use_class_weight", action="store_true", help="use sqrt-balanced class weights in loss")
+    parser.add_argument("--class_weight_power", type=float, default=0.5)
+    parser.add_argument("--use_focal", action="store_true")
+    parser.add_argument("--focal_gamma", type=float, default=1.2)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
 
-    parser.add_argument("--patience", type=int, default=4, help="early stopping patience")
-    parser.add_argument("--freeze_img_epochs", type=int, default=1, help="freeze image encoder for N epochs")
+    parser.add_argument("--logit_adjust", action="store_true")
+    parser.add_argument("--adjust_tau", type=float, default=1.0)
 
-    # --- Route B: logit adjustment ---
-    parser.add_argument("--logit_adjust", action="store_true", help="apply prior correction on logits during eval")
-    parser.add_argument("--adjust_tau", type=float, default=1.0, help="strength for logit adjustment")
+    # schedule innovation
+    parser.add_argument("--freeze_image_epochs", type=int, default=1)
 
+    # EMA
+    parser.add_argument("--ema", action="store_true")
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+
+    # ablation
     parser.add_argument("--ablation", action="store_true", help="train text_only + image_only + multimodal")
+
     args = parser.parse_args()
-
-    # 处理 override
-    if args.no_clean_text:
-        args.clean_text = False
-    else:
-        # 默认开启清洗
-        args.clean_text = True
-
-    if args.no_sampler:
-        args.use_sampler = False
-    else:
-        args.use_sampler = True
-
-    t0 = time.time()
+    seed_everything(args.seed)
     os.makedirs(args.run_dir, exist_ok=True)
 
+    t0 = time.time()
     if args.ablation:
         results = []
         for mode in ["text_only", "image_only", "multimodal"]:
             results.append(train_one_mode(args, mode))
         with open(os.path.join(args.run_dir, "ablation_results.json"), "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
-        print("\nSaved:", os.path.join(args.run_dir, "ablation_results.json"))
+        print("Saved:", os.path.join(args.run_dir, "ablation_results.json"))
     else:
         res = train_one_mode(args, "multimodal")
         with open(os.path.join(args.run_dir, "train_result.json"), "w", encoding="utf-8") as f:
             json.dump(res, f, ensure_ascii=False, indent=2)
-        print("\nSaved:", os.path.join(args.run_dir, "train_result.json"))
+        print("Saved:", os.path.join(args.run_dir, "train_result.json"))
 
-    print(f"\nDone. time={(time.time() - t0):.1f}s")
+    print(f"Done. time={(time.time()-t0):.1f}s")
 
 if __name__ == "__main__":
     main()
