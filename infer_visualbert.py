@@ -5,7 +5,7 @@ from typing import List, Dict
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
-from dataset import MultiModalDataset, ID2LABEL
+from dataset import MultiModalDataset, ID2LABEL, LABEL2ID
 from visualbert_model import VisualBertSentimentModel, VisualBertConfigLocal
 
 def get_device():
@@ -27,15 +27,57 @@ def macro_f1_from_confmat(conf):
         f1s.append(f1)
     return sum(f1s) / C
 
+def _ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+def infer_is_test_txt(path: str) -> bool:
+    """Heuristic to decide if data_path is test_without_label."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            header = f.readline()
+            if not header:
+                return True
+            comma = header.count(",")
+            tab = header.count("\t")
+            delim = "\t" if tab > comma else ","
+
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                if delim in raw:
+                    parts = raw.split(delim)
+                elif "\t" in raw:
+                    parts = raw.split("\t")
+                elif "," in raw:
+                    parts = raw.split(",")
+                else:
+                    parts = raw.split()
+
+                if len(parts) < 2:
+                    return True
+                y = str(parts[1]).strip().lower()
+                if y in ("", "null", "none", "nan"):
+                    return True
+                if y in ("neg", "neu", "pos"):
+                    return False
+                if y in LABEL2ID:
+                    return False
+                return True
+    except Exception:
+        return True
+
 def write_submit_txt(src_txt: str, out_txt: str, guid2pred: Dict[int, str]):
     """
     把 test_without_label.txt 中的 label(null) 替换成预测标签
     常见格式：guid,tag,post  或 guid tag post（dataset.py 也支持）
     这里按“行内第2列是标签”处理：把 null 替换成 pred
     """
-    os.makedirs(os.path.dirname(out_txt), exist_ok=True)
+    _ensure_dir(out_txt)
 
-    with open(src_txt, "r", encoding="utf-8") as f:
+    with open(src_txt, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
 
     if not lines:
@@ -88,6 +130,7 @@ def main():
 
     # 生成提交文件：把 test_without_label.txt 的 null 替换成预测标签
     parser.add_argument("--out_submit_txt", type=str, default=None)
+    parser.add_argument("--is_test", action="store_true", help="Force treat data_path as test_without_label")
 
     args = parser.parse_args()
     device = get_device()
@@ -101,19 +144,22 @@ def main():
     image_size = int(ckpt_args.get("image_size", 224))
     text_clean = ckpt_args.get("text_clean", "basic")
 
+    auto_is_test = infer_is_test_txt(args.data_path)
+    is_test = args.is_test or auto_is_test
+
     ds = MultiModalDataset(
         data_path=args.data_path,
         image_root=args.image_root,
         tokenizer=tokenizer,
         max_len=max_len,
         image_size=image_size,
+        is_test=is_test,
         train=False,
         text_clean=text_clean,
         img_aug="none",
     )
     loader = torch.utils.data.DataLoader(ds, batch_size=args.bs, shuffle=False)
 
-    # mode 推理：用 ckpt 的 cfg
     cfg_dict = ckpt.get("cfg", {})
     cfg = VisualBertConfigLocal(**cfg_dict)
     model = VisualBertSentimentModel(cfg).to(device)
@@ -124,8 +170,8 @@ def main():
     if logit_adjust is not None:
         logit_adjust = logit_adjust.to(device)
 
-    os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
-    os.makedirs(os.path.dirname(args.out_bad_csv), exist_ok=True)
+    _ensure_dir(args.out_csv)
+    _ensure_dir(args.out_bad_csv)
 
     all_rows: List[Dict] = []
     bad_rows: List[Dict] = []
@@ -134,7 +180,7 @@ def main():
     correct = 0
     conf = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
 
-    guid2pred_label = {}
+    guid2pred_label: Dict[int, str] = {}
 
     for batch in loader:
         ids = batch["input_ids"].to(device)
@@ -193,20 +239,19 @@ def main():
                 all_rows.append(row)
                 total += 1
 
-    # 写 CSV
-    with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(all_rows)
+    if all_rows:
+        with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_rows)
 
-    if len(bad_rows) > 0:
+    if bad_rows:
         with open(args.out_bad_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(bad_rows[0].keys()))
             writer.writeheader()
             writer.writerows(bad_rows)
 
-    # 打印指标
-    if "gt" in all_rows[0]:
+    if all_rows and ("gt" in all_rows[0]):
         acc = correct / max(1, total)
         mf1 = macro_f1_from_confmat(conf)
         print(f"[infer_visualbert] total={total} acc={acc:.4f} macro_f1={mf1:.4f}")
@@ -215,14 +260,14 @@ def main():
     else:
         print(f"[infer_visualbert] total={total} (no GT) saved preds -> {args.out_csv}")
 
-    print(f"[infer_visualbert] preview first {min(args.max_print, len(all_rows))} rows:")
-    for r in all_rows[: args.max_print]:
-        if "gt" in r:
-            print(r["guid"], "gt=", r["gt"], "pred=", r["pred"], "ok=", r["correct"])
-        else:
-            print(r["guid"], "pred=", r["pred"])
+    if all_rows:
+        print(f"[infer_visualbert] preview first {min(args.max_print, len(all_rows))} rows:")
+        for r in all_rows[: args.max_print]:
+            if "gt" in r:
+                print(r["guid"], "gt=", r["gt"], "pred=", r["pred"], "ok=", r["correct"])
+            else:
+                print(r["guid"], "pred=", r["pred"])
 
-    # 生成提交 txt
     if args.out_submit_txt is not None:
         write_submit_txt(args.data_path, args.out_submit_txt, guid2pred_label)
         print(f"[infer_visualbert] saved submit txt -> {args.out_submit_txt}")
