@@ -48,14 +48,10 @@ ai_hw5/
 
 ## 二、数据准备
 ### 2.1 数据格式
-`train.txt / val_split.txt / test_without_label.txt` 均支持以下格式之一（第 2 列为情感标签）：
+`train.txt / val_split.txt / test_without_label.txt` 均符合以下格式：
 
 ```text
-guid,tag,text
-```
-或
-```text
-guid\ttag\ttext
+guid,tag
 ```
 
 - 训练 / 验证集：`tag ∈ {negative, neutral, positive}`
@@ -246,6 +242,6 @@ python infer_blip.py --ckpt runs_blip_itm_retrieval_focal/best_blip.pt --data_pa
 ## 十、备注
 - 本项目所有实验均可复现，随机种子与参数均在脚本中显式给出。
 - 若在 Mac M 系列设备上运行，建议使用 `mps` 并关闭 DataLoader 多进程。
-- 所有推理均基于 验证集最优 checkpoint（best_*.pt）
+- 所有推理均基于验证集最优 checkpoint（best_*.pt）
 - 训练曲线仅用于辅助分析，不作为模型选择依据
 - 混淆矩阵与 bad cases 用于实验报告中的误差分析部分
