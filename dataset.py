@@ -3,7 +3,7 @@ import json
 import csv
 import re
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
@@ -24,21 +24,27 @@ LABEL_ALIASES = {
     "pos": "positive",
 }
 
-HEADER_TOKENS = {"guid", "id", "tag", "label", "sentiment", "text", "post", "image", "img", "img_path", "image_path"}
+HEADER_TOKENS = {
+    "guid", "id", "tag", "label", "sentiment",
+    "text", "post", "image", "img", "img_path", "image_path"
+}
+
 
 def _strip_bom(s: str) -> str:
     return s.lstrip("\ufeff").strip()
 
+
 def _guess_delimiter(first_line: str) -> str:
-    # crude but effective: choose delimiter with more hits in header
     comma = first_line.count(",")
     tab = first_line.count("\t")
     if tab > comma:
         return "\t"
     return ","
 
+
 def _safe_lower(x: Any) -> str:
     return str(x).strip().lower()
+
 
 def _normalize_label(y: Any) -> str:
     s = _safe_lower(y)
@@ -47,6 +53,7 @@ def _normalize_label(y: Any) -> str:
         s = LABEL_ALIASES[s]
     return s
 
+
 @dataclass
 class Sample:
     guid: str
@@ -54,10 +61,11 @@ class Sample:
     label: Optional[str]  # can be None for test_without_label
     image_key: str        # used to build image path
 
+
 class MultiModalDataset(Dataset):
     """
     Supports:
-      - .json / .jsonl: existing behavior (expects fields compatible with your code)
+      - .json / .jsonl
       - .txt / .csv / .tsv:
           must have header, and at least:
             guid (or id) column
@@ -65,7 +73,10 @@ class MultiModalDataset(Dataset):
           and optionally:
             post/text column
             image/img/image_path column
-        Common format you showed: guid,tag,post
+        If there is NO text column (your case: guid,tag),
+        we will try to load text by guid from image_root, e.g.:
+            {image_root}/{guid}.txt
+            {image_root}/{guid}/text.txt
     """
 
     def __init__(
@@ -91,13 +102,15 @@ class MultiModalDataset(Dataset):
         self.train = bool(kwargs.get("train", not is_test))
         self.img_aug = str(kwargs.get("img_aug", "none"))
 
+        # Cache for guid->text to avoid repeatedly hitting disk
+        self._text_cache: Dict[str, str] = {}
+
         if self.image_transform is None:
             size = self.image_size or 224
             mean = (0.485, 0.456, 0.406)
             std = (0.229, 0.224, 0.225)
 
             if self.train and self.img_aug in ["weak", "strong"]:
-                # 训练：带增强
                 aug = [
                     T.RandomResizedCrop(size, scale=(0.8, 1.0)),
                     T.RandomHorizontalFlip(p=0.5),
@@ -107,23 +120,28 @@ class MultiModalDataset(Dataset):
                         T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
                         T.RandomGrayscale(p=0.1),
                     ]
-                self.image_transform = T.Compose(aug + [
-                    T.ToTensor(),
-                    T.Normalize(mean=mean, std=std),
-                    # strong 时可再加一点随机擦除
-                    T.RandomErasing(p=0.25 if self.img_aug == "strong" else 0.1, scale=(0.02, 0.15))
-                ])
+                self.image_transform = T.Compose(
+                    aug
+                    + [
+                        T.ToTensor(),
+                        T.Normalize(mean=mean, std=std),
+                        T.RandomErasing(p=0.25 if self.img_aug == "strong" else 0.1, scale=(0.02, 0.15)),
+                    ]
+                )
             else:
-                # 验证/测试：确定性
-                self.image_transform = T.Compose([
-                    T.Resize((size, size)),
-                    T.ToTensor(),
-                    T.Normalize(mean=mean, std=std),
-                ])
+                self.image_transform = T.Compose(
+                    [
+                        T.Resize((size, size)),
+                        T.ToTensor(),
+                        T.Normalize(mean=mean, std=std),
+                    ]
+                )
 
         self.samples: List[Sample] = self._load(data_path)
 
-    # Text cleaning 
+    # ---------------------------
+    # Text cleaning
+    # ---------------------------
     def _clean_text(self, s: str) -> str:
         if s is None:
             return ""
@@ -132,17 +150,18 @@ class MultiModalDataset(Dataset):
             return s
         s = s.strip()
         if self.text_clean == "basic":
-            # remove extra whitespace
             s = re.sub(r"\s+", " ", s)
             return s
         if self.text_clean == "aggressive":
-            s = re.sub(r"http\S+", "", s)        # remove urls
-            s = re.sub(r"@\w+", "", s)           # remove @mentions
+            s = re.sub(r"http\S+", "", s)  # remove urls
+            s = re.sub(r"@\w+", "", s)     # remove @mentions
             s = re.sub(r"\s+", " ", s).strip()
             return s
         return s
-    
+
+    # ---------------------------
     # Label parsing
+    # ---------------------------
     def _get_label_id(self, y: Any) -> int:
         if y is None:
             raise ValueError("Label is None but is_test=False. Check your val/train files.")
@@ -151,34 +170,77 @@ class MultiModalDataset(Dataset):
             return LABEL2ID[s]
         raise ValueError(f"Bad label: {y}")
 
+    # ---------------------------
+    # Text loading by guid (NEW)
+    # ---------------------------
+    def _load_text_by_guid(self, guid: str) -> str:
+        """
+        Try to load text from disk when split files do not include text column.
+        Common candidates:
+          - {image_root}/{guid}.txt
+          - {image_root}/{guid}/text.txt
+        """
+        guid = str(guid).strip()
+        if not guid:
+            return ""
+
+        candidates = [
+            os.path.join(self.image_root, f"{guid}.txt"),
+            os.path.join(self.image_root, guid, "text.txt"),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        return f.read().strip()
+                except Exception:
+                    return ""
+        return ""
+
+    def _get_text_for_sample(self, guid: str, text_from_file: str) -> str:
+        """
+        Prefer text from dataset file if present; otherwise load by guid.
+        Cached for speed.
+        """
+        t = "" if text_from_file is None else str(text_from_file)
+        if t.strip():
+            return self._clean_text(t)
+
+        if guid in self._text_cache:
+            return self._text_cache[guid]
+
+        loaded = self._clean_text(self._load_text_by_guid(guid))
+        self._text_cache[guid] = loaded
+        return loaded
+
+    # ---------------------------
     # Image path building
+    # ---------------------------
     def _build_image_path(self, image_key: str) -> str:
         """
         If image_key already looks like a path, join with root if relative.
-        Otherwise, treat it as an id and try id.jpg/png/jpeg.
+        Otherwise, treat it as an id and try id.jpg/png/jpeg/webp.
         """
         k = str(image_key).strip()
         if not k:
-            # fallback
             k = "0"
 
-        # if already has extension, treat as filename/path
         if os.path.splitext(k)[1].lower() in {".jpg", ".jpeg", ".png", ".webp"}:
             p = k
             if not os.path.isabs(p):
                 p = os.path.join(self.image_root, p)
             return p
 
-        # otherwise try common extensions
         for ext in [".jpg", ".png", ".jpeg", ".webp"]:
             p = os.path.join(self.image_root, k + ext)
             if os.path.exists(p):
                 return p
 
-        # fallback
         return os.path.join(self.image_root, k + ".jpg")
 
+    # ---------------------------
     # TXT/CSV loader
+    # ---------------------------
     def _load_txt_or_csv(self, p: str) -> List[Sample]:
         with open(p, "r", encoding="utf-8", errors="ignore") as f:
             first_line = f.readline()
@@ -194,7 +256,6 @@ class MultiModalDataset(Dataset):
 
             header = [_safe_lower(_strip_bom(h)) for h in raw_header]
 
-            # map columns
             def find_col(*candidates: str) -> Optional[int]:
                 for c in candidates:
                     c = c.lower()
@@ -208,15 +269,12 @@ class MultiModalDataset(Dataset):
             img_i = find_col("image", "img", "image_path", "img_path")
 
             if guid_i is None:
-                raise ValueError(
-                    f"[dataset] Cannot find guid/id column in {p}. header={raw_header}"
-                )
+                raise ValueError(f"[dataset] Cannot find guid/id column in {p}. header={raw_header}")
 
             samples: List[Sample] = []
             for row in reader:
                 if not row:
                     continue
-                # pad if short
                 if len(row) < len(header):
                     row = row + [""] * (len(header) - len(row))
 
@@ -227,14 +285,12 @@ class MultiModalDataset(Dataset):
                 label = None
                 if label_i is not None:
                     label = _strip_bom(row[label_i])
-                    # skip accidental header-like rows
                     if _safe_lower(label) in HEADER_TOKENS and _safe_lower(guid) in HEADER_TOKENS:
                         continue
 
-                text = ""
-                if text_i is not None:
-                    text = row[text_i]
-                text = self._clean_text(text)
+                # NEW: if text_i missing (your case), load by guid from image_root
+                text_from_file = row[text_i] if (text_i is not None) else ""
+                text = self._get_text_for_sample(guid, text_from_file)
 
                 image_key = guid
                 if img_i is not None and row[img_i].strip():
@@ -244,7 +300,9 @@ class MultiModalDataset(Dataset):
 
         return samples
 
+    # ---------------------------
     # JSON/JSONL loader
+    # ---------------------------
     def _load_json_or_jsonl(self, p: str) -> List[Sample]:
         ext = os.path.splitext(p)[1].lower()
         samples: List[Sample] = []
@@ -261,11 +319,12 @@ class MultiModalDataset(Dataset):
                     label = obj.get("label", obj.get("tag", obj.get("sentiment", None)))
                     text = obj.get("text", obj.get("post", ""))
                     image_key = obj.get("image", obj.get("img", obj.get("image_path", guid)))
-                    samples.append(Sample(guid=guid, text=self._clean_text(text), label=label, image_key=str(image_key)))
-        else:  # .json
+                    # NEW: if json text empty, try load by guid
+                    text = self._get_text_for_sample(guid, text)
+                    samples.append(Sample(guid=guid, text=text, label=label, image_key=str(image_key)))
+        else:
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # allow list[dict] or dict with 'data'
             if isinstance(data, dict) and "data" in data:
                 data = data["data"]
             if not isinstance(data, list):
@@ -277,7 +336,8 @@ class MultiModalDataset(Dataset):
                 label = obj.get("label", obj.get("tag", obj.get("sentiment", None)))
                 text = obj.get("text", obj.get("post", ""))
                 image_key = obj.get("image", obj.get("img", obj.get("image_path", guid)))
-                samples.append(Sample(guid=guid, text=self._clean_text(text), label=label, image_key=str(image_key)))
+                text = self._get_text_for_sample(guid, text)
+                samples.append(Sample(guid=guid, text=text, label=label, image_key=str(image_key)))
         return samples
 
     def _load(self, data_path: str) -> List[Sample]:
